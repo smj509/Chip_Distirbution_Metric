@@ -41,14 +41,9 @@ DEFAULT_STOCKS = (
 
 DEFAULT_HOLD_DAYS = (5, 10, 20)
 
-DEFAULT_BUCKETS = [
-    (-1.00, -0.50),
-    (-0.50, -0.20),
-    (-0.20,  0.00),
-    ( 0.00,  0.25),
-    ( 0.25,  0.50),
-    ( 0.50,  1.00),
-]
+# 分位数分桶：每股按自身全样本 score 的 p10/p30/p70/p90 划分
+# 0=极低(≤p10)  1=偏低(p10,p30]  2=中性(p30,p70]  3=偏高(p70,p90]  4=极高(>p90)
+QUANTILE_BUCKET_LABELS = ("极低", "偏低", "中性", "偏高", "极高")
 
 # 写回 CSV 的列名（无后缀版）
 BACKTEST_EXPORT_COLS = (
@@ -86,14 +81,49 @@ def _compute_future_returns(
     return pd.DataFrame(out, index=df.index)
 
 
-def _score_to_basket(score: float, buckets: list[tuple[float, float]]) -> float:
-    """将得分映射到桶编号 0~5；无法归类则返回 NaN。"""
-    if pd.isna(score):
+def _percentile_thresholds(scores: pd.Series) -> dict[str, float]:
+    """计算一组得分的 p10/p30/p70/p90 阈值。"""
+    s = pd.to_numeric(scores, errors="coerce").dropna()
+    if len(s) == 0:
+        return {}
+    return {
+        "p10": float(s.quantile(0.10)),
+        "p30": float(s.quantile(0.30)),
+        "p70": float(s.quantile(0.70)),
+        "p90": float(s.quantile(0.90)),
+    }
+
+
+def _score_to_quantile_basket(score: float, th: dict[str, float]) -> float:
+    """按分位数阈值将得分映射到桶 0~4。"""
+    if pd.isna(score) or not th:
         return float("nan")
-    for idx, (lo, hi) in enumerate(buckets):
-        if lo <= score < hi:
-            return float(idx)
-    return float("nan")
+    if score <= th["p10"]:
+        return 0.0
+    if score <= th["p30"]:
+        return 1.0
+    if score <= th["p70"]:
+        return 2.0
+    if score <= th["p90"]:
+        return 3.0
+    return 4.0
+
+
+def assign_quantile_baskets(day_df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, float]]:
+    """按该股全样本分位数为逐日数据打上 basket(0~4)。"""
+    th = _percentile_thresholds(day_df["total_score"])
+    out = day_df.copy()
+    out["basket"] = out["total_score"].apply(lambda s: _score_to_quantile_basket(s, th))
+    return out, th
+
+
+def _format_quantile_thresholds(th: dict[str, float]) -> str:
+    if not th:
+        return "分位阈值: N/A"
+    return (
+        f"分位阈值: p10={th['p10']:+.4f}  p30={th['p30']:+.4f}  "
+        f"p70={th['p70']:+.4f}  p90={th['p90']:+.4f}"
+    )
 
 
 def _ret_to_winning(ret: float) -> str:
@@ -106,7 +136,6 @@ def _ret_to_winning(ret: float) -> str:
 def _prepare_export_frame(
     day_df: pd.DataFrame,
     *,
-    buckets: list[tuple[float, float]],
     hold_days: Sequence[int],
     column_suffix: str = "",
 ) -> pd.DataFrame:
@@ -116,7 +145,11 @@ def _prepare_export_frame(
     out["_merge_date"] = pd.to_datetime(day_df["trade_date"])
 
     out[f"score{suf}"] = day_df["total_score"].values
-    out[f"basket{suf}"] = day_df["total_score"].apply(lambda s: _score_to_basket(s, buckets)).values
+    if "basket" in day_df.columns:
+        out[f"basket{suf}"] = day_df["basket"].values
+    else:
+        tagged, _ = assign_quantile_baskets(day_df)
+        out[f"basket{suf}"] = tagged["basket"].values
 
     for h in hold_days:
         ret_col = f"ret_{h}d"
@@ -149,12 +182,10 @@ def export_backtest_to_csv(
     csv_path: str | Path,
     day_df: pd.DataFrame,
     *,
-    buckets: list[tuple[float, float]] | None = None,
     hold_days: Sequence[int] = DEFAULT_HOLD_DAYS,
     column_suffix: str = "",
 ) -> Path:
     """把 score / basket / 未来收益等列合并写回股票日线 CSV。"""
-    buckets = buckets or DEFAULT_BUCKETS
     csv_path = Path(csv_path)
     raw = pd.read_csv(csv_path)
     raw = _drop_backtest_cols(raw, column_suffix=column_suffix)
@@ -164,7 +195,7 @@ def export_backtest_to_csv(
         raise ValueError(f"{csv_path}: 找不到日期列")
 
     export_df = _prepare_export_frame(
-        day_df, buckets=buckets, hold_days=hold_days, column_suffix=column_suffix,
+        day_df, hold_days=hold_days, column_suffix=column_suffix,
     )
     raw[date_col] = pd.to_datetime(raw[date_col], errors="coerce")
     merged = raw.merge(export_df, left_on=date_col, right_on="_merge_date", how="left")
@@ -179,11 +210,9 @@ def export_compare_backtest_to_csv(
     raw_day_df: pd.DataFrame,
     adj_day_df: pd.DataFrame,
     *,
-    buckets: list[tuple[float, float]] | None = None,
     hold_days: Sequence[int] = DEFAULT_HOLD_DAYS,
 ) -> Path:
     """对比模式：同一 CSV 写入原始/修正两套回测列（后缀 _raw / _adj）。"""
-    buckets = buckets or DEFAULT_BUCKETS
     csv_path = Path(csv_path)
     raw = pd.read_csv(csv_path)
     raw = _drop_backtest_cols(raw, column_suffix="_raw")
@@ -195,10 +224,10 @@ def export_compare_backtest_to_csv(
 
     raw[date_col] = pd.to_datetime(raw[date_col], errors="coerce")
     exp_raw = _prepare_export_frame(
-        raw_day_df, buckets=buckets, hold_days=hold_days, column_suffix="_raw",
+        raw_day_df, hold_days=hold_days, column_suffix="_raw",
     )
     exp_adj = _prepare_export_frame(
-        adj_day_df, buckets=buckets, hold_days=hold_days, column_suffix="_adj",
+        adj_day_df, hold_days=hold_days, column_suffix="_adj",
     )
     merged = raw.merge(exp_raw, left_on=date_col, right_on="_merge_date", how="left")
     merged = merged.drop(columns=["_merge_date"])
@@ -275,24 +304,26 @@ def run_backtest(
     data_dir: str = "data",
     start_date: str | None = None,
     hold_days: Sequence[int] = DEFAULT_HOLD_DAYS,
-    buckets: list[tuple[float, float]] | None = None,
     config: dict[str, tuple[float, float]] = WEIGHT_CONFIG,
     use_decay: bool | None = None,
     compare_decay: bool = False,
     export_to_csv: bool = True,
 ) -> dict[str, Any]:
-    """运行回测：对指定股票逐日打分，按得分分桶统计未来收益。
+    """运行回测：对指定股票逐日打分，按分位数分桶统计未来收益。
 
     Args:
         codes: 股票代码（单个字符串或列表）
         data_dir: CSV 数据目录
         start_date: 起始日期筛选
         hold_days: 持有天数列表
-        buckets: 得分分桶边界 [(lo, hi), ...]
         config: 权重配置
         use_decay: None=跟随stock默认(通常False); True=修正筹码; False=原始筹码
         compare_decay: True=同时跑原始+修正两版，返回对比结果；此时 use_decay 被忽略
         export_to_csv: True=把 score/basket/未来收益等列写回各股票 CSV
+
+    分桶规则（每股独立）:
+        basket 0~4 = 极低/偏低/中性/偏高/极高
+        按该股全样本 score 的 p10/p30/p70/p90 划分
 
     Returns:
         dict，含:
@@ -309,19 +340,17 @@ def run_backtest(
     if isinstance(codes, str):
         codes = [codes]
 
-    buckets = buckets or DEFAULT_BUCKETS
-
     # 对比模式：同时跑两版
     if compare_decay:
         print("\n[对比模式] 原始筹码 vs 修正筹码")
         raw_result = _run_backtest_core(
             codes, data_dir=data_dir, start_date=start_date,
-            hold_days=hold_days, buckets=buckets, config=config,
+            hold_days=hold_days, config=config,
             use_decay=False,
         )
         adj_result = _run_backtest_core(
             codes, data_dir=data_dir, start_date=start_date,
-            hold_days=hold_days, buckets=buckets, config=config,
+            hold_days=hold_days, config=config,
             use_decay=True,
         )
         raw_result["use_decay"] = False
@@ -329,7 +358,7 @@ def run_backtest(
         if export_to_csv:
             _export_compare_results(
                 codes, raw_result, adj_result,
-                data_dir=data_dir, buckets=buckets, hold_days=hold_days,
+                data_dir=data_dir, hold_days=hold_days,
             )
         return {
             "raw": raw_result,
@@ -342,14 +371,14 @@ def run_backtest(
     # 单模式
     result = _run_backtest_core(
         codes, data_dir=data_dir, start_date=start_date,
-        hold_days=hold_days, buckets=buckets, config=config,
+        hold_days=hold_days, config=config,
         use_decay=use_decay,
     )
     result["use_decay"] = use_decay if use_decay is not None else False
     if export_to_csv:
         _export_single_results(
             codes, result,
-            data_dir=data_dir, buckets=buckets, hold_days=hold_days,
+            data_dir=data_dir, hold_days=hold_days,
         )
     return result
 
@@ -359,7 +388,6 @@ def _export_single_results(
     result: dict[str, Any],
     *,
     data_dir: str,
-    buckets: list[tuple[float, float]],
     hold_days: Sequence[int],
 ) -> None:
     daily = result["daily"]
@@ -372,7 +400,6 @@ def _export_single_results(
         export_backtest_to_csv(
             csv_path,
             code_daily.drop(columns=["code"], errors="ignore"),
-            buckets=buckets,
             hold_days=hold_days,
         )
         print(f"  [OK] {code}: 已写入 {csv_path}")
@@ -384,7 +411,6 @@ def _export_compare_results(
     adj_result: dict[str, Any],
     *,
     data_dir: str,
-    buckets: list[tuple[float, float]],
     hold_days: Sequence[int],
 ) -> None:
     print("\n[CSV 导出] 对比模式列后缀: _raw / _adj")
@@ -398,7 +424,6 @@ def _export_compare_results(
             csv_path,
             raw_daily.drop(columns=["code"], errors="ignore"),
             adj_daily.drop(columns=["code"], errors="ignore"),
-            buckets=buckets,
             hold_days=hold_days,
         )
         print(f"  [OK] {code}: 已写入 {csv_path}")
@@ -410,16 +435,16 @@ def _run_backtest_core(
     data_dir: str,
     start_date: str | None,
     hold_days: Sequence[int],
-    buckets: list[tuple[float, float]],
     config: dict[str, tuple[float, float]],
     use_decay: bool | None,
 ) -> dict[str, Any]:
-    """回测核心逻辑：逐只股票加载、打分、分桶。"""
+    """回测核心逻辑：逐只股票加载、打分、分位数分桶。"""
     label = "修正筹码" if use_decay else "原始筹码"
     print(f"\n--- {label} ---")
 
     all_rows = []
     per_stock_buckets: dict[str, pd.DataFrame] = {}
+    per_stock_thresholds: dict[str, dict[str, float]] = {}
 
     for code in codes:
         csv_path = csv_path_for_code(code, data_dir)
@@ -441,9 +466,12 @@ def _run_backtest_core(
 
         try:
             day_df = _score_single_stock(stock, hold_days=hold_days, config=config, use_decay=use_decay)
+            day_df, th = assign_quantile_baskets(day_df)
             day_df["code"] = code
+            per_stock_thresholds[code] = th
             all_rows.append(day_df)
             print(f"    {len(day_df)} 个交易日已打分")
+            print(f"    {_format_quantile_thresholds(th)}")
         except Exception as e:
             print(f"  [SKIP] {code}: 打分失败 ({e})")
             continue
@@ -458,15 +486,16 @@ def _run_backtest_core(
         if len(code_daily) == 0:
             continue
         per_stock_buckets[code] = _compute_bucket_stats(
-            code_daily, buckets=buckets, hold_days=hold_days
+            code_daily, hold_days=hold_days
         )
 
-    merged_buckets = _compute_bucket_stats(daily, buckets=buckets, hold_days=hold_days)
+    merged_buckets = _compute_bucket_stats(daily, hold_days=hold_days)
 
     return {
         "daily": daily,
         "buckets": merged_buckets,
         "per_stock": per_stock_buckets,
+        "per_stock_thresholds": per_stock_thresholds,
         "codes": codes,
         "hold_days": hold_days,
     }
@@ -475,22 +504,17 @@ def _run_backtest_core(
 def _compute_bucket_stats(
     daily: pd.DataFrame,
     *,
-    buckets: list[tuple[float, float]],
     hold_days: Sequence[int],
 ) -> pd.DataFrame:
-    """按得分分桶统计：每个桶的样本数、平均收益、胜率。
-
-    Returns:
-        DataFrame，列: bucket, count, avg_ret_5d, win_rate_5d, ...
-    """
+    """按 basket(0~4) 统计：每个桶的样本数、平均收益、胜率。"""
     rows = []
 
-    for lo, hi in buckets:
-        mask = (daily["total_score"] >= lo) & (daily["total_score"] < hi)
+    for bid, label in enumerate(QUANTILE_BUCKET_LABELS):
+        mask = pd.to_numeric(daily["basket"], errors="coerce") == bid
         subset = daily[mask]
 
         row = {
-            "bucket": f"[{lo:+.2f}, {hi:+.2f})",
+            "bucket": f"{bid}={label}",
             "count": len(subset),
         }
 
@@ -544,34 +568,38 @@ def _format_bucket_table(
     return "\n".join(lines)
 
 
-def _print_high_score_days(
+def _print_high_basket_days(
     daily: pd.DataFrame,
     code: str,
     hold_days: Sequence[int],
-    threshold: float = 0.50,
+    *,
+    basket_id: int = 4,
     label: str = "",
 ) -> None:
-    """打印得分 >= threshold 的交易日明细。"""
+    """打印 basket 为极高(4) 的交易日明细。"""
     code_daily = daily[daily["code"] == code]
-    high_days = code_daily[code_daily["total_score"] >= threshold].sort_values("total_score", ascending=False)
+    high_days = code_daily[pd.to_numeric(code_daily["basket"], errors="coerce") == basket_id]
+    high_days = high_days.sort_values("total_score", ascending=False)
+    bucket_name = QUANTILE_BUCKET_LABELS[basket_id] if 0 <= basket_id < len(QUANTILE_BUCKET_LABELS) else str(basket_id)
 
     if len(high_days) == 0:
-        print(f"  [{label}] 得分 >= {threshold:+.2f} 的交易日: 无")
+        print(f"  [{label}] basket={basket_id}({bucket_name}) 的交易日: 无")
         return
 
     prefix = f"  [{label}] " if label else "  "
-    print(f"{prefix}得分 >= {threshold:+.2f} 的交易日 ({len(high_days)} 个):")
-    print(f"{prefix}  日期         | 得分     | 收盘   |", end="")
+    print(f"{prefix}basket={basket_id}({bucket_name}) 的交易日 ({len(high_days)} 个):")
+    print(f"{prefix}  日期         | 得分     | basket | 收盘   |", end="")
     for h in hold_days:
         print(f" {h}日收益 |", end="")
     print()
-    print(f"{prefix}" + "-" * (22 + 10 + 8 + len(hold_days) * 10))
+    print(f"{prefix}" + "-" * (22 + 10 + 8 + 8 + len(hold_days) * 10))
 
     for _, row in high_days.iterrows():
         date_str = str(row["trade_date"])[:10]
         score_str = f"{row['total_score']:+.4f}"
+        basket_str = f"{int(row['basket'])}" if pd.notna(row.get("basket")) else "NA"
         close_str = f"{row['close']:.2f}"
-        line = f"{prefix}  {date_str} | {score_str} | {close_str} |"
+        line = f"{prefix}  {date_str} | {score_str} | {basket_str:>6s} | {close_str} |"
         for h in hold_days:
             ret_col = f"ret_{h}d"
             if pd.notna(row.get(ret_col)):
@@ -594,6 +622,7 @@ def print_bucket_report(result: dict[str, Any]) -> None:
     hold_days = result["hold_days"]
     codes = result["codes"]
     per_stock = result.get("per_stock", {})
+    thresholds_map = result.get("per_stock_thresholds", {})
     use_decay = result.get("use_decay", False)
     label = "修正筹码" if use_decay else "原始筹码"
 
@@ -615,9 +644,11 @@ def print_bucket_report(result: dict[str, Any]) -> None:
         print(table)
         print(f"  得分分布: 中位数={total.median():+.4f}, 平均={total.mean():+.4f}")
         print(f"  得分范围: [{total.min():+.4f}, {total.max():+.4f}]")
+        th = thresholds_map.get(code, {})
+        if th:
+            print(f"  {_format_quantile_thresholds(th)}")
 
-        # 列出得分 >= 0.50 的交易日明细
-        _print_high_score_days(result["daily"], code, hold_days, threshold=0.50, label=label)
+        _print_high_basket_days(result["daily"], code, hold_days, basket_id=4, label=label)
 
     # 合并汇总
     total = result["daily"]["total_score"].dropna()
@@ -627,20 +658,21 @@ def print_bucket_report(result: dict[str, Any]) -> None:
     print(f"  得分分布: 中位数={total.median():+.4f}, 平均={total.mean():+.4f}")
     print(f"  得分范围: [{total.min():+.4f}, {total.max():+.4f}]")
 
-    # 合计中得分 >= 0.50 的交易日
-    print(f"\n  得分 >= +0.50 的所有交易日:")
-    high_all = result["daily"][result["daily"]["total_score"] >= 0.50].sort_values("total_score", ascending=False)
+    # 合计中 basket=4(极高) 的交易日
+    print(f"\n  basket=4(极高) 的所有交易日:")
+    high_all = result["daily"][pd.to_numeric(result["daily"]["basket"], errors="coerce") == 4]
+    high_all = high_all.sort_values("total_score", ascending=False)
     if len(high_all) == 0:
         print("    无")
     else:
-        print(f"    日期         | 股票       | 得分     | 收盘   |", end="")
+        print(f"    日期         | 股票       | 得分     | basket | 收盘   |", end="")
         for h in hold_days:
             print(f" {h}日收益 |", end="")
         print()
         print("    " + "-" * (22 + 12 + 10 + 8 + len(hold_days) * 10))
         for _, row in high_all.iterrows():
             date_str = str(row["trade_date"])[:10]
-            line = f"    {date_str} | {row['code']:10s} | {row['total_score']:+.4f} | {row['close']:.2f} |"
+            line = f"    {date_str} | {row['code']:10s} | {row['total_score']:+.4f} | {int(row['basket']):>6d} | {row['close']:.2f} |"
             for h in hold_days:
                 ret_col = f"ret_{h}d"
                 if pd.notna(row.get(ret_col)):
@@ -681,6 +713,9 @@ def _print_compare_report(result: dict[str, Any]) -> None:
         if raw_ps is not None:
             raw_total = raw["daily"][raw["daily"]["code"] == code]["total_score"].dropna()
             print(f"  【原始筹码】得分中位数={raw_total.median():+.4f}, 范围=[{raw_total.min():+.4f}, {raw_total.max():+.4f}]")
+            raw_th = raw.get("per_stock_thresholds", {}).get(code, {})
+            if raw_th:
+                print(f"    {_format_quantile_thresholds(raw_th)}")
             table = _format_bucket_table(raw_ps, hold_days)
             for line in table.split("\n"):
                 print(f"    {line}")
@@ -689,15 +724,17 @@ def _print_compare_report(result: dict[str, Any]) -> None:
         if adj_ps is not None:
             adj_total = adj["daily"][adj["daily"]["code"] == code]["total_score"].dropna()
             print(f"  【修正筹码】得分中位数={adj_total.median():+.4f}, 范围=[{adj_total.min():+.4f}, {adj_total.max():+.4f}]")
+            adj_th = adj.get("per_stock_thresholds", {}).get(code, {})
+            if adj_th:
+                print(f"    {_format_quantile_thresholds(adj_th)}")
             table = _format_bucket_table(adj_ps, hold_days)
             for line in table.split("\n"):
                 print(f"    {line}")
 
-        # 得分 >= 0.50 的交易日明细
         if raw_ps is not None:
-            _print_high_score_days(raw["daily"], code, hold_days, threshold=0.50, label="原始")
+            _print_high_basket_days(raw["daily"], code, hold_days, basket_id=4, label="原始")
         if adj_ps is not None:
-            _print_high_score_days(adj["daily"], code, hold_days, threshold=0.50, label="修正")
+            _print_high_basket_days(adj["daily"], code, hold_days, basket_id=4, label="修正")
 
     # 合计对比
     print(f"\n--- 合计对比 ---")
@@ -721,5 +758,5 @@ def _print_compare_report(result: dict[str, Any]) -> None:
 
 if __name__ == "__main__":
     # 对比模式：同时跑原始筹码和修正筹码
-    result = run_backtest(DEFAULT_STOCKS, compare_decay=True)
+    result = run_backtest(DEFAULT_STOCKS, compare_decay=False)
     print_bucket_report(result)
