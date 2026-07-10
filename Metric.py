@@ -390,7 +390,7 @@ def metric_avg_cost_slope(
     if not all(_valid(a) for a in avgs):
         return _pair("平均成本趋势", _sig(False, 0, "数据不足"), _sig(False, 0, "数据不足"))
 
-    start, end = avgs[0], avgs[-1]
+    start, end = avgs[0], avgs[-1]#5天前的平均成本和今天的平均成本
     pct = (end - start) / start if start else 0.0
     bull_ok = pct >= min_pct
     bear_ok = pct <= -min_pct
@@ -463,7 +463,7 @@ def metric_pullback_support(
     if require_uptrend and len(ctx.period_costs) >= 2:
         p = DEFAULT_PERIODS
         costs = [ctx.period_costs.get(x) for x in p if _valid(ctx.period_costs.get(x, float("nan")))]
-        uptrend = len(costs) >= 2 and costs[0] > costs[-1]
+        uptrend = len(costs) >= 2 and costs[0] > costs[-1]#5日成本高于30日成本，说明是上升趋势
 
     near_support = False
     hit_name, hit_val = "", float("nan")

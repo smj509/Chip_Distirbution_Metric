@@ -15,6 +15,8 @@
 
     # 自定义参数
     result = run_backtest("sz.002384", hold_days=[5, 10, 20])
+
+    # 回测后 CSV 末尾会追加 score, basket, average-*-periods-return, *-periods-winning 等列
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ from typing import Any, Sequence
 
 import pandas as pd
 
-from chip_new import csv_path_for_code, load_stock
+from chip_new import COLUMN_ALIASES, _pick_col, csv_path_for_code, load_stock
 from Metric import build_context, screen_stock, weighted_score, WEIGHT_CONFIG
 
 
@@ -48,6 +50,18 @@ DEFAULT_BUCKETS = [
     ( 0.50,  1.00),
 ]
 
+# 写回 CSV 的列名（无后缀版）
+BACKTEST_EXPORT_COLS = (
+    "score",
+    "basket",
+    "average-5-periods-return",
+    "5-periods-winning",
+    "average-10-periods-return",
+    "10-periods-winning",
+    "average-20-periods-return",
+    "20-periods-winning",
+)
+
 
 def _compute_future_returns(
     df: pd.DataFrame,
@@ -70,6 +84,129 @@ def _compute_future_returns(
         out[f"ret_{h}d"] = rets
 
     return pd.DataFrame(out, index=df.index)
+
+
+def _score_to_basket(score: float, buckets: list[tuple[float, float]]) -> float:
+    """将得分映射到桶编号 0~5；无法归类则返回 NaN。"""
+    if pd.isna(score):
+        return float("nan")
+    for idx, (lo, hi) in enumerate(buckets):
+        if lo <= score < hi:
+            return float(idx)
+    return float("nan")
+
+
+def _ret_to_winning(ret: float) -> str:
+    """未来收益 > 0 为 true，否则 false；无数据则空字符串。"""
+    if pd.isna(ret):
+        return ""
+    return "true" if ret > 0 else "false"
+
+
+def _prepare_export_frame(
+    day_df: pd.DataFrame,
+    *,
+    buckets: list[tuple[float, float]],
+    hold_days: Sequence[int],
+    column_suffix: str = "",
+) -> pd.DataFrame:
+    """把逐日打分结果整理为可合并进 CSV 的列。"""
+    suf = column_suffix
+    out = pd.DataFrame()
+    out["_merge_date"] = pd.to_datetime(day_df["trade_date"])
+
+    out[f"score{suf}"] = day_df["total_score"].values
+    out[f"basket{suf}"] = day_df["total_score"].apply(lambda s: _score_to_basket(s, buckets)).values
+
+    for h in hold_days:
+        ret_col = f"ret_{h}d"
+        if ret_col not in day_df.columns:
+            continue
+        rets = day_df[ret_col]
+        out[f"average-{h}-periods-return{suf}"] = rets.values
+        out[f"{h}-periods-winning{suf}"] = [_ret_to_winning(r) for r in rets]
+
+    return out
+
+
+def _drop_backtest_cols(df: pd.DataFrame, *, column_suffix: str = "") -> pd.DataFrame:
+    """删除 CSV 中已有的回测列，避免重复写入。"""
+    out = df.copy()
+    suffixes = {column_suffix}
+    if column_suffix == "":
+        suffixes.add("_raw")
+        suffixes.add("_adj")
+
+    for suf in suffixes:
+        for col in BACKTEST_EXPORT_COLS:
+            name = f"{col}{suf}"
+            if name in out.columns:
+                out = out.drop(columns=[name])
+    return out
+
+
+def export_backtest_to_csv(
+    csv_path: str | Path,
+    day_df: pd.DataFrame,
+    *,
+    buckets: list[tuple[float, float]] | None = None,
+    hold_days: Sequence[int] = DEFAULT_HOLD_DAYS,
+    column_suffix: str = "",
+) -> Path:
+    """把 score / basket / 未来收益等列合并写回股票日线 CSV。"""
+    buckets = buckets or DEFAULT_BUCKETS
+    csv_path = Path(csv_path)
+    raw = pd.read_csv(csv_path)
+    raw = _drop_backtest_cols(raw, column_suffix=column_suffix)
+
+    date_col = _pick_col(raw.columns, COLUMN_ALIASES["trade_date"])
+    if date_col is None:
+        raise ValueError(f"{csv_path}: 找不到日期列")
+
+    export_df = _prepare_export_frame(
+        day_df, buckets=buckets, hold_days=hold_days, column_suffix=column_suffix,
+    )
+    raw[date_col] = pd.to_datetime(raw[date_col], errors="coerce")
+    merged = raw.merge(export_df, left_on=date_col, right_on="_merge_date", how="left")
+    merged = merged.drop(columns=["_merge_date"])
+
+    merged.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    return csv_path
+
+
+def export_compare_backtest_to_csv(
+    csv_path: str | Path,
+    raw_day_df: pd.DataFrame,
+    adj_day_df: pd.DataFrame,
+    *,
+    buckets: list[tuple[float, float]] | None = None,
+    hold_days: Sequence[int] = DEFAULT_HOLD_DAYS,
+) -> Path:
+    """对比模式：同一 CSV 写入原始/修正两套回测列（后缀 _raw / _adj）。"""
+    buckets = buckets or DEFAULT_BUCKETS
+    csv_path = Path(csv_path)
+    raw = pd.read_csv(csv_path)
+    raw = _drop_backtest_cols(raw, column_suffix="_raw")
+    raw = _drop_backtest_cols(raw, column_suffix="_adj")
+
+    date_col = _pick_col(raw.columns, COLUMN_ALIASES["trade_date"])
+    if date_col is None:
+        raise ValueError(f"{csv_path}: 找不到日期列")
+
+    raw[date_col] = pd.to_datetime(raw[date_col], errors="coerce")
+    exp_raw = _prepare_export_frame(
+        raw_day_df, buckets=buckets, hold_days=hold_days, column_suffix="_raw",
+    )
+    exp_adj = _prepare_export_frame(
+        adj_day_df, buckets=buckets, hold_days=hold_days, column_suffix="_adj",
+    )
+    merged = raw.merge(exp_raw, left_on=date_col, right_on="_merge_date", how="left")
+    merged = merged.drop(columns=["_merge_date"])
+    merged = merged.merge(exp_adj, left_on=date_col, right_on="_merge_date", how="left")
+    merged = merged.drop(columns=["_merge_date"])
+
+    merged.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    return csv_path
 
 
 def _score_single_stock(
@@ -142,6 +279,7 @@ def run_backtest(
     config: dict[str, tuple[float, float]] = WEIGHT_CONFIG,
     use_decay: bool | None = None,
     compare_decay: bool = False,
+    export_to_csv: bool = True,
 ) -> dict[str, Any]:
     """运行回测：对指定股票逐日打分，按得分分桶统计未来收益。
 
@@ -154,6 +292,7 @@ def run_backtest(
         config: 权重配置
         use_decay: None=跟随stock默认(通常False); True=修正筹码; False=原始筹码
         compare_decay: True=同时跑原始+修正两版，返回对比结果；此时 use_decay 被忽略
+        export_to_csv: True=把 score/basket/未来收益等列写回各股票 CSV
 
     Returns:
         dict，含:
@@ -187,6 +326,11 @@ def run_backtest(
         )
         raw_result["use_decay"] = False
         adj_result["use_decay"] = True
+        if export_to_csv:
+            _export_compare_results(
+                codes, raw_result, adj_result,
+                data_dir=data_dir, buckets=buckets, hold_days=hold_days,
+            )
         return {
             "raw": raw_result,
             "adj": adj_result,
@@ -202,7 +346,62 @@ def run_backtest(
         use_decay=use_decay,
     )
     result["use_decay"] = use_decay if use_decay is not None else False
+    if export_to_csv:
+        _export_single_results(
+            codes, result,
+            data_dir=data_dir, buckets=buckets, hold_days=hold_days,
+        )
     return result
+
+
+def _export_single_results(
+    codes: Sequence[str],
+    result: dict[str, Any],
+    *,
+    data_dir: str,
+    buckets: list[tuple[float, float]],
+    hold_days: Sequence[int],
+) -> None:
+    daily = result["daily"]
+    print("\n[CSV 导出]")
+    for code in codes:
+        code_daily = daily[daily["code"] == code]
+        if code_daily.empty:
+            continue
+        csv_path = csv_path_for_code(code, data_dir)
+        export_backtest_to_csv(
+            csv_path,
+            code_daily.drop(columns=["code"], errors="ignore"),
+            buckets=buckets,
+            hold_days=hold_days,
+        )
+        print(f"  [OK] {code}: 已写入 {csv_path}")
+
+
+def _export_compare_results(
+    codes: Sequence[str],
+    raw_result: dict[str, Any],
+    adj_result: dict[str, Any],
+    *,
+    data_dir: str,
+    buckets: list[tuple[float, float]],
+    hold_days: Sequence[int],
+) -> None:
+    print("\n[CSV 导出] 对比模式列后缀: _raw / _adj")
+    for code in codes:
+        raw_daily = raw_result["daily"][raw_result["daily"]["code"] == code]
+        adj_daily = adj_result["daily"][adj_result["daily"]["code"] == code]
+        if raw_daily.empty and adj_daily.empty:
+            continue
+        csv_path = csv_path_for_code(code, data_dir)
+        export_compare_backtest_to_csv(
+            csv_path,
+            raw_daily.drop(columns=["code"], errors="ignore"),
+            adj_daily.drop(columns=["code"], errors="ignore"),
+            buckets=buckets,
+            hold_days=hold_days,
+        )
+        print(f"  [OK] {code}: 已写入 {csv_path}")
 
 
 def _run_backtest_core(
@@ -225,7 +424,7 @@ def _run_backtest_core(
     for code in codes:
         csv_path = csv_path_for_code(code, data_dir)
         if not Path(csv_path).exists():
-            print(f"  ⚠ 跳过 {code}: CSV 不存在 ({csv_path})")
+            print(f"  [SKIP] {code}: CSV 不存在 ({csv_path})")
             continue
 
         try:
@@ -235,9 +434,9 @@ def _run_backtest_core(
                 fetch_top10=False,
                 save_enriched=False,
             )
-            print(f"  ✓ {code}: 加载成功")
+            print(f"  [OK] {code}: 加载成功")
         except Exception as e:
-            print(f"  ⚠ 跳过 {code}: 加载失败 ({e})")
+            print(f"  [SKIP] {code}: 加载失败 ({e})")
             continue
 
         try:
@@ -246,7 +445,7 @@ def _run_backtest_core(
             all_rows.append(day_df)
             print(f"    {len(day_df)} 个交易日已打分")
         except Exception as e:
-            print(f"  ⚠ 跳过 {code}: 打分失败 ({e})")
+            print(f"  [SKIP] {code}: 打分失败 ({e})")
             continue
 
     if not all_rows:
